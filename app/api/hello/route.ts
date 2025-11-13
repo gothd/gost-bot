@@ -7,7 +7,7 @@ type Data = {
   imageUrl: string;
 };
 
-export default function GET() {
+export function GET() {
   return NextResponse.json<Data>(
     {
       name: "Göst",
