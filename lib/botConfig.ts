@@ -6,6 +6,7 @@ import {
   sendWhatsAppMessage,
 } from "./whatsappService";
 
+import { ListRow } from "@/types/whatsapp";
 import { getMainMenuRows, quizDictionary } from "./quizFlow"; // Importe seu novo dicionário
 
 // ⚠️ GERENCIAMENTO DE ESTADO (Importante!)
@@ -88,7 +89,13 @@ export const botConfig = {
         await sendWhatsAppButtons(to, step.question, step.options);
       } else {
         // Se tiver mais de 3, envia lista
-        const rows = step.options.map((o) => ({ id: o.id, title: o.title }));
+        const rows: ListRow[] = step.options.map((o) => ({
+          id: o.id,
+          title: o.title,
+          // 👉 Adicionar o mapeamento da descrição 👈
+          description: o.description ?? undefined,
+        }));
+
         await sendWhatsAppList(to, step.question, "Ver opções", "Escolha uma", rows);
       }
     }
