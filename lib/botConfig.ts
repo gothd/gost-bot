@@ -6,17 +6,33 @@ import {
   sendWhatsAppMessage,
 } from "./whatsappService";
 
-import { ListRow } from "@/types/whatsapp";
-import { getMainMenuRows, quizDictionary } from "./quizFlow"; // Importe seu novo dicionário
-
-// ⚠️ GERENCIAMENTO DE ESTADO (Importante!)
-// Para perguntas de 'type: "text"', você precisa saber
-// qual pergunta o usuário está respondendo.
-// Em produção, use um BD (Redis, Firestore, etc.)
-// Aqui, vamos usar um Map simples para simular:
-export const userState = new Map<string, { currentQuestion: string | null }>();
+import { ButtonOption, ListRow } from "@/types/whatsapp";
+// 🚨 Importações corrigidas para o Firebase Service
+import { EXIT_TO_AGENT_ID } from "./constants";
+import {
+  canBotReply,
+  closeCurrentTalk,
+  getOrCreateContact,
+  saveQuizResponse,
+  updateBotStatus,
+} from "./firebaseService";
+import { getMainMenuRows, quizDictionary } from "./quizFlow";
+import { normalizeText } from "./textUtils";
 
 export const botConfig = {
+  // Função utilitária segura de envio
+  safeSendMessage: async (to: string, message: any) => {
+    const canReply = await canBotReply(to);
+    if (!canReply) {
+      console.error(`[24H POLICY] Abortando envio para ${to}. Janela fechada.`);
+      await closeCurrentTalk(to); // Garante limpeza
+      return;
+    }
+    await sendWhatsAppMessage(to, message);
+    // E salva no histórico (opcionalmente aqui ou fora)
+    // await saveMessage(from, JSON.stringify(message), 'OUTBOUND');
+  },
+
   greetings: async (to: string, customerName: string) => {
     await sendDynamicTemplate({
       to: to,
@@ -31,12 +47,7 @@ export const botConfig = {
 
   fallback: async (to: string, reason?: string, rawMessage?: any) => {
     // 🚨 Log de auditoria
-    console.warn("[FALLBACK]", {
-      from: to,
-      reason: reason || "Texto/Interação não reconhecida",
-      rawMessage,
-    });
-
+    console.warn("[FALLBACK]", { from: to, reason: reason, rawMessage });
     // Reapresenta o menu
     await sendWhatsAppMessage(to, {
       type: "interactive",
@@ -56,19 +67,9 @@ export const botConfig = {
    * 1. Inicia o questionário (chamado quando o usuário clica em "Começar agora")
    */
   startQuiz: async (to: string) => {
-    const rows = getMainMenuRows(); // Pega as linhas do quizFlow.ts
-
-    // Reseta o estado
-    userState.set(to, { currentQuestion: null });
-
-    // Usa sua função auxiliar diretamente
-    await sendWhatsAppList(
-      to,
-      "Vamos começar! Selecione uma etapa para avançar nas perguntas.",
-      "Ver etapas", // Label do botão
-      "Etapas do projeto", // Título da seção
-      rows
-    );
+    await updateBotStatus(to, "IDLE", null); // Limpa o passo e o status WORKFLOW
+    const rows = getMainMenuRows();
+    await sendWhatsAppList(to, "Vamos começar! Selecione uma etapa:", "Ver etapas", "Etapas", rows);
   },
 
   /**
@@ -81,31 +82,35 @@ export const botConfig = {
       return;
     }
 
-    // Se for pergunta de múltipla escolha
+    // Opção extra de saída
+    const exitOption: ButtonOption & { description?: string } = {
+      id: EXIT_TO_AGENT_ID,
+      title: "Falar com consultor",
+      description: "Encerrar quiz e pedir atendimento humano", // Apenas para listas
+    };
+
     if (step.type === "options" && step.options) {
-      // Reutiliza a lógica que você tinha em sendQuestionMenu:
-      // Se tiver 3 ou menos opções, envia botões
-      if (step.options.length <= 3) {
-        await sendWhatsAppButtons(to, step.question, step.options);
+      const allOptions = [...step.options, exitOption];
+
+      if (allOptions.length <= 3) {
+        await sendWhatsAppButtons(to, step.question, allOptions);
       } else {
-        // Se tiver mais de 3, envia lista
-        const rows: ListRow[] = step.options.map((o) => ({
+        const rows: ListRow[] = allOptions.map((o) => ({
           id: o.id,
           title: o.title,
-          // 👉 Adicionar o mapeamento da descrição 👈
           description: o.description ?? undefined,
         }));
-
         await sendWhatsAppList(to, step.question, "Ver opções", "Escolha uma", rows);
       }
-    }
-    // Se for pergunta de texto aberto
-    else if (step.type === "text") {
-      // ⚠️ Salva o estado! Agora sabemos que o próximo texto é a resposta para "q4"
-      userState.set(to, { currentQuestion: step.id });
+    } else if (step.type === "text") {
+      // Salva o estado
+      await updateBotStatus(to, "WORKFLOW", step.id);
+
       await sendWhatsAppMessage(to, {
         type: "text",
-        text: { body: step.question },
+        text: {
+          body: `${step.question}\n\n(Digite *humano* a qualquer momento para falar com um consultor)`,
+        },
       });
     }
   },
@@ -114,40 +119,84 @@ export const botConfig = {
    * 3. Recebe a resposta de uma pergunta de OPÇÕES (ex: "q1_vendas")
    */
   handleQuizAnswer: async (to: string, answerId: string) => {
-    // Ex: answerId = "q1_vendas"
-    const questionId = answerId.split("_")[0]; // "q1"
+    // 🚨 INTERCEPTAÇÃO DE SAÍDA
+    if (answerId === EXIT_TO_AGENT_ID) {
+      await botConfig.transferToAgent(to);
+      return;
+    }
 
+    const questionId = answerId.split("_")[0]; // "q1"
     console.log(`[QUIZ] Resposta de ${to} para ${questionId}: ${answerId}`);
-    // TODO: Salvar a resposta no seu banco de dados
-    // (ex: saveUserAnswer(from, questionId, answerId))
+
+    // Aqui salvamos o ID da opção (ex: "q1_vendas").
+    // Se quiser salvar o texto legível ("Vender produtos"), precisaria buscar no dicionário.
+    await saveQuizResponse(to, questionId, answerId);
 
     // Após salvar, envia o menu principal de volta
-    // (Opcional: você pode incrementar para mostrar quais já foram respondidas)
-    await sendWhatsAppMessage(to, { type: "text", text: { body: "✅ Resposta salva!" } });
-    await botConfig.startQuiz(to); // Volta ao menu principal
+    await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Resposta salva!" } });
+    await botConfig.startQuiz(to);
   },
 
   /**
    * 4. Recebe a resposta de uma pergunta de TEXTO
    */
   handleFreeTextAnswer: async (to: string, text: string, rawMessage: any) => {
-    const state = userState.get(to);
-    const currentQuestionId = state?.currentQuestion; // Ex: "q4"
+    // 🚨 INTERCEPTAÇÃO DE SAÍDA VIA TEXTO
+    const normalizedText = normalizeText(text);
+    if (normalizedText.includes("humano") || normalizedText.includes("consultor")) {
+      await botConfig.transferToAgent(to);
+      return;
+    }
+
+    const contact = await getOrCreateContact(to, "");
+    const currentQuestionId = contact.currentStep;
 
     if (currentQuestionId) {
       console.log(`[QUIZ] Resposta (texto) de ${to} para ${currentQuestionId}: ${text}`);
-      // TODO: Salvar a resposta no seu banco de dados
-      // (ex: saveUserAnswer(from, currentQuestionId, text))
 
-      // Limpa o estado e volta ao menu
-      userState.set(to, { currentQuestion: null });
-      await sendWhatsAppMessage(to, { type: "text", text: { body: "✅ Resposta anotada!" } });
-      await botConfig.startQuiz(to); // Volta ao menu principal
+      await saveQuizResponse(to, currentQuestionId, text);
+
+      // Limpa o estado no FIRESTORE e volta ao menu
+      await updateBotStatus(to, "IDLE", null);
+
+      await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Resposta anotada!" } });
+      await botConfig.startQuiz(to);
     } else {
-      // É um texto aleatório, não uma resposta de quiz
+      // Se não há currentStep, o bot não estava esperando texto do quiz.
       await botConfig.fallback(to, "Texto não reconhecido", rawMessage);
     }
   },
 
-  sendMessage: sendWhatsAppMessage,
+  /**
+   * 5. Transfere para o Agente (Novo Status)
+   */
+  transferToAgent: async (to: string) => {
+    await updateBotStatus(to, "AGENT", null);
+    await botConfig.safeSendMessage(to, {
+      type: "text",
+      text: {
+        body: "Entendido! Vou chamar um de nossos consultores para analisar o que você já respondeu e te ajudar.\n\nAguarde um momento.",
+      },
+    });
+    // Aqui você poderia notificar o admin via email/slack/push se quisesse
+  },
+
+  /**
+   * Avisa o usuário que o quiz está sendo retomado e envia a pergunta.
+   */
+  notifyAndAskQuestion: async (to: string, stepId: string) => {
+    const step = quizDictionary[stepId];
+    if (!step) return;
+
+    // 1. Mensagem de Contexto (O que ele deve fazer)
+    await botConfig.safeSendMessage(to, {
+      type: "text",
+      text: {
+        body: `Olá novamente! Você parou na etapa *${step.title}*. Por favor, continue para que possamos finalizar seu orçamento.`,
+      },
+    });
+
+    // 2. Envia a pergunta real
+    await botConfig.askQuizQuestion(to, stepId);
+  },
 };

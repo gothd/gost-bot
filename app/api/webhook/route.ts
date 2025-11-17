@@ -1,4 +1,11 @@
-import { botConfig, extractKeywords, isGreeting, userState } from "@/lib";
+import { botConfig, extractKeywords, isGreeting } from "@/lib";
+import {
+  getOrCreateContact,
+  isMessageProcessed,
+  saveMessage,
+  updateBotStatus,
+} from "@/lib/firebaseService";
+import { WhatsAppMessage, WhatsAppWebhookBody } from "@/types/whatsapp";
 import { NextRequest, NextResponse } from "next/server";
 
 // --- Handler para GET (Verificação do WhatsApp) ---
@@ -12,107 +19,135 @@ export async function GET(req: NextRequest) {
 
   if (mode && token && mode === "subscribe" && token === verifyToken) {
     return new NextResponse(challenge, { status: 200 });
-  } else {
-    return new NextResponse(null, { status: 403 });
   }
+  return new NextResponse(null, { status: 403 });
 }
 
 // --- Handler para POST (Recebimento de mensagens) ---
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const body = (await req.json()) as WhatsAppWebhookBody;
 
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
+    // Verificação de segurança da estrutura básica
+    const value = body.entry?.[0]?.changes?.[0]?.value;
+    if (!value) return new NextResponse(null, { status: 200 });
 
-    // 🚨 1. Mensagens recebidas
-    const messages = value?.messages;
-    const contacts = value?.contacts;
+    // 1. Evento de Mensagem (INBOUND)
+    const messages = value.messages;
+    const contacts = value.contacts; // 🟢 Contatos vindo do Value
 
-    if (messages && messages[0]) {
-      const msg = messages[messages.length - 1];
+    if (messages && messages.length > 0) {
+      const msg = messages[messages.length - 1] as WhatsAppMessage;
       const from = msg.from;
-      console.warn("[ID]:", msg.id);
-      console.log(JSON.stringify(msg, null, 2));
-      const customerName = contacts?.[0]?.profile?.name || "Cliente";
 
-      // Variável para unificar o ID da interação
-      let interactionId: string | undefined;
-
-      // 1. Mensagem de Texto
-      if (msg.type === "text") {
-        const text = msg.text.body;
-        const state = userState.get(from); // 👈 2. LER O ESTADO DO USUÁRIO
-
-        // 3. PRIORIDADE 1: Está respondendo uma pergunta do quiz?
-        if (state?.currentQuestion) {
-          await botConfig.handleFreeTextAnswer(from, text, msg);
-        }
-        // 4. PRIORIDADE 2: É uma saudação?
-        else if (isGreeting(text)) {
-          await botConfig.greetings(from, customerName);
-        }
-        // 5. PRIORIDADE 3: É uma palavra-chave?
-        else {
-          const keywords = extractKeywords(text);
-          if (keywords.includes("site")) {
-            await botConfig.criar_site(from);
-          } else {
-            // 6. PRIORIDADE 4: Fallback de texto
-            await botConfig.fallback(from, "Texto não reconhecido", msg);
-          }
-        }
-      } // 2. Mensagem Interativa (Botão/Lista da sua aplicação)
-      else if (msg.type === "interactive") {
-        const interactive = msg.interactive;
-        switch (interactive?.type) {
-          case "button_reply":
-            interactionId = interactive.button_reply.id;
-            break;
-          case "list_reply":
-            interactionId = interactive.list_reply.id;
-            break;
-        }
-      } // 3. Mensagem de Botão de Template (NOVA LÓGICA)
-      else if (msg.type === "button") {
-        interactionId = msg.button?.payload; // O payload que você define no template
-        console.log(`[TEMPLATE BUTTON]: Payload: ${interactionId}, Text: ${msg.button?.text}`);
-      } // 4. Outros tipos de mensagem (imagem, áudio, sticker, etc.)
-      else {
-        await botConfig.fallback(from, "Tipo de mensagem não suportado", msg);
+      // 🛡️ 0. IDEMPOTÊNCIA DE PRODUÇÃO
+      // Se já processamos este ID de mensagem, retornamos 200 imediatamente
+      if (await isMessageProcessed(msg.id)) {
+        console.log(`[IDEMPOTENCY] Mensagem ${msg.id} duplicada ignorada.`);
+        return new NextResponse(null, { status: 200 });
       }
 
-      // 5. Processador Central de Interações (se houver um ID)
-      // Este bloco agora trata IDs vindos de 'interactive' E 'button'
-      if (interactionId) {
-        console.log("[INTERACTION ID]:", interactionId);
+      // 🟢 Acesso seguro ao contact name
+      const contactProfile = contacts?.[0];
+      const customerName = contactProfile?.profile.name || "Cliente";
 
-        // 👇 Adicione aqui os payloads dos seus botões de TEMPLATE
-        if (interactionId === "Começar agora") {
-          // A. Usuário clicou em "Começar agora"
-          await botConfig.startQuiz(from);
-        } else if (interactionId.startsWith("q") && !interactionId.includes("_")) {
-          // B. Usuário selecionou uma ETAPA do menu principal (ex: "q1", "q2")
-          await botConfig.askQuizQuestion(from, interactionId);
-        } else if (interactionId.startsWith("q") && interactionId.includes("_")) {
-          // C. Usuário selecionou uma RESPOSTA (ex: "q1_vendas", "q2_sim")
-          await botConfig.handleQuizAnswer(from, interactionId);
-        } else if (interactionId === "criar_site") {
-          await botConfig.criar_site(from);
-        } else if (interactionId === "criar_site_info") {
-          await botConfig.sendMessage(from, {
-            type: "text",
-            text: { body: "Aqui estão mais informações sobre Criar site..." },
-          });
-        } else {
-          // ID de interação não reconhecido
-          await botConfig.fallback(from, "Interação desconhecida", msg);
+      let content: string | undefined;
+      let interactionId: string | undefined;
+
+      // 1. EXTRAÇÃO E NORMALIZAÇÃO
+      if (msg.type === "text") {
+        content = msg.text.body;
+      } else if (msg.type === "interactive") {
+        const interactive = msg.interactive;
+        if (interactive.type === "button_reply") {
+          interactionId = interactive.button_reply.id;
+          content = interactive.button_reply.title;
+        } else if (interactive.type === "list_reply") {
+          interactionId = interactive.list_reply.id;
+          content = interactive.list_reply.title;
+        }
+      } else if (msg.type === "button") {
+        // Botão de Template (Quick Reply)
+        interactionId = msg.button.payload;
+        content = msg.button.text;
+      }
+
+      // Se não conseguimos extrair nada útil, ignoramos a lógica do bot
+      if (!content && !interactionId) {
+        return new NextResponse(null, { status: 200 });
+      }
+
+      // 2. BUSCA E HISTÓRICO
+      const contact = await getOrCreateContact(from, customerName);
+      await saveMessage(from, content || "[Mídia/Outros]", "INBOUND");
+
+      // 3. ROTEADOR DE LÓGICA
+
+      // MODO AGENTE (Prioridade Máxima: Humano no comando)
+      if (contact.botStatus === "AGENT") {
+        return new NextResponse(null, { status: 200 });
+      }
+
+      // MODO WORKFLOW (Prioridade 1: Resposta de Texto Livre)
+      if (contact.botStatus === "WORKFLOW" && contact.currentStep && msg.type === "text") {
+        await botConfig.handleFreeTextAnswer(from, content!, msg);
+        return new NextResponse(null, { status: 200 });
+      }
+
+      // MODO IDLE (Prioridade 2: Comandos e Retomada)
+      if (contact.botStatus === "IDLE" || contact.botStatus === "WORKFLOW") {
+        // Nota: Permitimos WORKFLOW aqui para capturar interações (botões)
+
+        // 🟢 2.1: RETOMADA APÓS 24H (Só se IDLE)
+        if (contact.botStatus === "IDLE" && contact.currentStep && contact.currentStep !== "q1") {
+          await updateBotStatus(from, "WORKFLOW", contact.currentStep);
+          await botConfig.notifyAndAskQuestion(from, contact.currentStep);
+          return new NextResponse(null, { status: 200 });
+        }
+
+        // 🟢 2.2: INTERAÇÕES (Botões de Quiz ou Menu)
+        if (interactionId) {
+          // Respostas do Quiz OU Botão de "Falar com consultor" (EXIT_TO_AGENT)
+          // Se for EXIT_TO_AGENT, o handleQuizAnswer vai tratar.
+          if (interactionId.startsWith("q") || interactionId === "EXIT_TO_AGENT") {
+            await botConfig.handleQuizAnswer(from, interactionId);
+          }
+          if (interactionId.startsWith("q")) {
+            // Respostas do Quiz (q1_vendas, q2_sim...)
+            await botConfig.handleQuizAnswer(from, interactionId);
+          } else if (interactionId === "Começar agora") {
+            await updateBotStatus(from, "WORKFLOW", "q1");
+            await botConfig.askQuizQuestion(from, "q1");
+          } else if (interactionId === "criar_site") {
+            await botConfig.criar_site(from);
+          } else if (interactionId === "criar_site_info") {
+            await botConfig.safeSendMessage(from, {
+              type: "text",
+              text: { body: "Aqui estão mais informações sobre Criar site..." },
+            });
+          } else {
+            await botConfig.fallback(from, "Interação inválida", msg);
+          }
+          return new NextResponse(null, { status: 200 });
+        }
+
+        // 🟢 PRI 2.3: TEXTO LIVRE (Saudações/Keywords, apenas se IDLE, pois se fosse WORKFLOW texto, já teria sido capturado acima)
+        if (msg.type === "text" && content && contact.botStatus === "IDLE") {
+          if (isGreeting(content)) {
+            await botConfig.greetings(from, customerName);
+          } else {
+            const keywords = extractKeywords(content);
+            if (keywords.includes("site")) {
+              await botConfig.criar_site(from);
+            } else {
+              await botConfig.fallback(from, "Texto não reconhecido", msg);
+            }
+          }
         }
       }
     }
 
-    // 🚨 2. Status de mensagens enviadas
+    // Status Updates (Sent/Read/Delivered)
     const statuses = value?.statuses;
     if (statuses && statuses[0]) {
       const statusEvent = statuses[0];
