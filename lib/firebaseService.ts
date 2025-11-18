@@ -1,9 +1,78 @@
 import { firestore as db } from "@/lib/firestore";
-import { BotStatus, ContactData } from "@/types/bot";
+import { BotStatus, ContactData, MessageData, TalkData } from "@/types/bot";
+import { WhatsAppMessage } from "@/types/whatsapp"; // ✅ Importação dos tipos do WhatsApp
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { WINDOW_HOURS_MS } from "./constants";
 
-// --- Funções Auxiliares ---
+// --- Tipos de Retorno para o Roteador ---
+
+export interface RoutingData {
+  content: string | undefined; // Texto livre, ou título da resposta interativa
+  interactionId: string | undefined; // ID da resposta interativa (qN_opção) ou payload do botão
+}
+
+// --- Funções Auxiliares de Roteamento e DB ---
+
+/**
+ * 🛠️ Extrai o conteúdo e ID necessários para o roteamento.
+ */
+export function extractRoutingData(msg: WhatsAppMessage): RoutingData {
+  let content: string | undefined;
+  let interactionId: string | undefined;
+
+  // 1. EXTRAÇÃO E NORMALIZAÇÃO
+  if (msg.type === "text") {
+    content = msg.text.body;
+  } else if (msg.type === "interactive") {
+    const interactive = msg.interactive;
+    if (interactive.type === "button_reply") {
+      interactionId = interactive.button_reply.id;
+      content = interactive.button_reply.title;
+    } else if (interactive.type === "list_reply") {
+      interactionId = interactive.list_reply.id;
+      content = interactive.list_reply.title;
+    }
+  } else if (msg.type === "button") {
+    // Botão de Template (Quick Reply)
+    interactionId = msg.button.payload;
+    content = msg.button.text;
+  }
+  // Para outros tipos (image, audio, etc.), content/interactionId permanecem undefined.
+
+  return { content, interactionId };
+}
+
+/**
+ * 🛠️ Extrai o conteúdo para salvar no histórico do DB (com representação de mídias).
+ */
+function getDbContent(msg: WhatsAppMessage): string {
+  if (msg.type === "text") {
+    return msg.text.body;
+  } else if (msg.type === "interactive") {
+    const interactive = msg.interactive;
+    if (interactive.type === "button_reply") {
+      return `[Resposta Botão] ID: ${interactive.button_reply.id} / Título: ${interactive.button_reply.title}`;
+    }
+    if (interactive.type === "list_reply") {
+      return `[Resposta Lista] ID: ${interactive.list_reply.id} / Título: ${interactive.list_reply.title}`;
+    }
+    return "[Interação Desconhecida]";
+  } else if (msg.type === "button") {
+    return `[Resposta Template] Payload: ${msg.button.payload} / Título: ${msg.button.text}`;
+  } else if (msg.type === "image") {
+    return `[Imagem] ${msg.image.caption || "Sem legenda"}`;
+  } else if (msg.type === "audio") {
+    return "[Áudio]";
+  } else if (msg.type === "video") {
+    return `[Vídeo] ${msg.video.caption || "Sem legenda"}`;
+  } else if (msg.type === "document") {
+    return `[Documento] ${msg.document.filename || "Sem nome"}`;
+  } else if (msg.type === "sticker") {
+    return "[Sticker]";
+  } else {
+    return `[Mensagem Tipo: ${msg.type}]`;
+  }
+}
 
 /**
  * Verifica se o contato está dentro da janela de 24h.
@@ -142,6 +211,34 @@ export async function closeCurrentTalk(from: string) {
 }
 
 /**
+ * 🔍 Busca o campo 'quizData' da conversa ativa do contato.
+ * @param from - Número do usuário
+ * @param talkId - ID da conversa ativa (obtida do documento do contato)
+ * @returns Um objeto com as respostas do quiz (ex: { q1: "Vendas", q2: "Sim" })
+ */
+export async function getActiveQuizData(
+  from: string,
+  talkId: string | null
+): Promise<Record<string, string>> {
+  if (!talkId) {
+    return {}; // Retorna vazio se não houver conversa ativa
+  }
+
+  try {
+    const talkDoc = await db.collection("contacts").doc(from).collection("talks").doc(talkId).get();
+
+    if (talkDoc.exists) {
+      const data = talkDoc.data() as TalkData; // Cast para o tipo TalkData
+      return data.quizData || {};
+    }
+  } catch (error) {
+    console.error(`[FIREBASE] Erro ao buscar quizData para talk ${talkId}:`, error);
+  }
+
+  return {};
+}
+
+/**
  * 💾 Salva uma resposta estruturada do Quiz na conversa ativa.
  * Isso cria/atualiza um campo 'quizData' no documento da Talk.
  * @param from - Número do usuário
@@ -201,6 +298,62 @@ export async function isMessageProcessed(messageId: string): Promise<boolean> {
   });
 
   return false;
+}
+
+/**
+ * 💾 Salva uma mensagem de entrada (inbound) e atualiza o estado do contato
+ * atomicamente usando um Batched Write.
+ * @param msg - O objeto da mensagem recebida (WhatsAppMessage).
+ * @param talkId - ID da conversa ativa.
+ * @param newStatus - Opcional, novo status para o contato.
+ */
+export async function processInboundMessage(
+  msg: WhatsAppMessage,
+  talkId: string | null,
+  newStatus?: BotStatus
+): Promise<void> {
+  const from = msg.from; // Número de origem vem do objeto msg
+
+  if (!talkId) {
+    console.warn(
+      `[INBOUND] Tentativa de processar mensagem sem talk ativa para ${from}. Apenas atualizando o contato.`
+    );
+  }
+
+  const batch = db.batch();
+  const contactRef = db.collection("contacts").doc(from);
+
+  // 1. Atualização Atômica do Contato (contacts/{from})
+  const contactUpdate: Partial<ContactData> = {
+    lastInboundAt: FieldValue.serverTimestamp() as unknown as Timestamp,
+  };
+
+  if (newStatus) {
+    contactUpdate.botStatus = newStatus;
+  }
+
+  batch.update(contactRef, contactUpdate);
+
+  // 2. Salvar Mensagem no Histórico (contacts/{from}/talks/{talkId}/messages/{messageId})
+  if (talkId && msg.id) {
+    const talkMessagesRef = contactRef.collection("talks").doc(talkId).collection("messages");
+    const newMessageRef = talkMessagesRef.doc(msg.id);
+
+    const content = getDbContent(msg);
+
+    const messageData: MessageData = {
+      messageId: msg.id,
+      direction: "INBOUND",
+      type: msg.type,
+      content: content,
+      timestamp: FieldValue.serverTimestamp() as unknown as Timestamp,
+    };
+
+    batch.set(newMessageRef, messageData);
+  }
+
+  // 3. Execução Atômica
+  await batch.commit();
 }
 
 /**

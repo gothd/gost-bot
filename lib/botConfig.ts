@@ -12,12 +12,13 @@ import { EXIT_TO_AGENT_ID } from "./constants";
 import {
   canBotReply,
   closeCurrentTalk,
+  getActiveQuizData,
   getOrCreateContact,
   saveQuizResponse,
   updateBotStatus,
 } from "./firebaseService";
 import { getMainMenuRows, quizDictionary } from "./quizFlow";
-import { normalizeText } from "./textUtils";
+import { normalizeText, truncateWhatsAppText } from "./textUtils";
 
 export const botConfig = {
   // Função utilitária segura de envio
@@ -67,9 +68,65 @@ export const botConfig = {
    * 1. Inicia o questionário (chamado quando o usuário clica em "Começar agora")
    */
   startQuiz: async (to: string) => {
+    // 1. Busca o contato principal para obter o ID da conversa ativa
+    const contact = await getOrCreateContact(to, "");
+
+    // 2. Busca os dados do quiz da conversa ativa (USANDO A NOVA FUNÇÃO)
+    const talkId = contact.activeTalkId;
+    const currentResponses = await getActiveQuizData(to, talkId ?? null);
+
     await updateBotStatus(to, "IDLE", null); // Limpa o passo e o status WORKFLOW
-    const rows = getMainMenuRows();
-    await sendWhatsAppList(to, "Vamos começar! Selecione uma etapa:", "Ver etapas", "Etapas", rows);
+
+    // 3. Obtém as linhas do menu base
+    const baseRows = getMainMenuRows();
+
+    // 4. Mapeia as linhas para adicionar a marca de progresso
+    const rows: ListRow[] = baseRows.map((row) => {
+      const readableAnswer = currentResponses[row.id];
+
+      const PROGRESS_PREFIX = "✅ ";
+      const TITLE_MAX_LENGTH = 20;
+      const DESCRIPTION_MAX_LENGTH = 72; // Limite de caracteres para a descrição
+
+      let newTitle: string;
+
+      // 1. TRUNCAGEM DO TITLE (Limite: 20)
+      if (readableAnswer) {
+        // Se respondido: usa prefixo
+        newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, PROGRESS_PREFIX);
+      } else {
+        // Se não respondido: sem prefixo
+        newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, "");
+      }
+
+      // 2. TRUNCAGEM DA DESCRIPTION (Limite: 72)
+      let newDescription: string;
+
+      if (readableAnswer) {
+        // Se respondido, a descrição mostra a resposta do usuário
+        const answerText = `Sua resposta: ${readableAnswer}`;
+        newDescription = truncateWhatsAppText(answerText, DESCRIPTION_MAX_LENGTH, "");
+      } else {
+        // Se não respondido, usa a descrição padrão da linha (se existir)
+        newDescription = row.description
+          ? truncateWhatsAppText(row.description, DESCRIPTION_MAX_LENGTH, "")
+          : ""; // Garante string vazia se row.description for undefined
+      }
+
+      return {
+        id: row.id,
+        title: newTitle,
+        description: newDescription,
+      };
+    });
+
+    await sendWhatsAppList(
+      to,
+      "Selecione uma etapa para responder ou editar. As etapas respondidas são marcadas com ✅.",
+      "Ver etapas",
+      "Progresso do Orçamento",
+      rows
+    );
   },
 
   /**
@@ -126,11 +183,42 @@ export const botConfig = {
     }
 
     const questionId = answerId.split("_")[0]; // "q1"
-    console.log(`[QUIZ] Resposta de ${to} para ${questionId}: ${answerId}`);
+    const step = quizDictionary[questionId];
+    // ⚠️ Tratamento de erro: Se o step não é válido, voltamos ao menu principal (caminho seguro)
+    if (!step || step.type !== "options" || !step.options) {
+      console.error(`[QUIZ] Etapa ${questionId} inválida. Retornando ao menu principal.`);
+      await botConfig.safeSendMessage(to, {
+        type: "text",
+        text: {
+          body: "🚨 Desculpe, houve um erro. Por favor, selecione uma etapa do menu principal.",
+        },
+      });
+      await botConfig.startQuiz(to);
+      return;
+    }
 
-    // Aqui salvamos o ID da opção (ex: "q1_vendas").
-    // Se quiser salvar o texto legível ("Vender produtos"), precisaria buscar no dicionário.
-    await saveQuizResponse(to, questionId, answerId);
+    // 🔍 BUSCA DO TEXTO LEGÍVEL
+    const selectedOption = step.options.find((option) => option.id === answerId);
+    const readableAnswer = selectedOption?.title || answerId; // Usa o título ou o ID como fallback
+
+    // ⚠️ Tratamento de erro: Se o ID da resposta não for encontrado na lista de opções
+    if (!readableAnswer) {
+      console.warn(
+        `[QUIZ] Opção ${answerId} não encontrada para ${questionId}. Repetindo pergunta.`
+      );
+      await botConfig.safeSendMessage(to, {
+        type: "text",
+        text: { body: "❌ Opção inválida. Por favor, selecione uma das opções abaixo:" },
+      });
+      // Repete a pergunta atual, dando ao usuário uma nova chance
+      await botConfig.askQuizQuestion(to, questionId);
+      return;
+    }
+
+    console.log(`[QUIZ] Resposta de ${to} para ${questionId}: ${readableAnswer} (${answerId})`);
+
+    // 💾 Salva o TEXTO LEGÍVEL como a resposta no Firestore
+    await saveQuizResponse(to, questionId, readableAnswer);
 
     // Após salvar, envia o menu principal de volta
     await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Resposta salva!" } });
@@ -171,7 +259,7 @@ export const botConfig = {
    * 5. Transfere para o Agente (Novo Status)
    */
   transferToAgent: async (to: string) => {
-    await updateBotStatus(to, "AGENT", null);
+    await updateBotStatus(to, "HUMAN_PENDING", null);
     await botConfig.safeSendMessage(to, {
       type: "text",
       text: {

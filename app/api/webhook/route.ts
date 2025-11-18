@@ -1,8 +1,9 @@
 import { botConfig, extractKeywords, isGreeting } from "@/lib";
 import {
+  extractRoutingData,
   getOrCreateContact,
   isMessageProcessed,
-  saveMessage,
+  processInboundMessage,
   updateBotStatus,
 } from "@/lib/firebaseService";
 import { WhatsAppMessage, WhatsAppWebhookBody } from "@/types/whatsapp";
@@ -39,58 +40,55 @@ export async function POST(req: NextRequest) {
     if (messages && messages.length > 0) {
       const msg = messages[messages.length - 1] as WhatsAppMessage;
       const from = msg.from;
+      const customerName = contacts?.[0]?.profile.name || "Cliente";
 
-      // 🛡️ 0. IDEMPOTÊNCIA DE PRODUÇÃO
+      // 🛡️ 1. IDEMPOTÊNCIA DE PRODUÇÃO
       // Se já processamos este ID de mensagem, retornamos 200 imediatamente
       if (await isMessageProcessed(msg.id)) {
-        console.log(`[IDEMPOTENCY] Mensagem ${msg.id} duplicada ignorada.`);
+        console.log(`[DEDUPLICAÇÃO] Mensagem ${msg.id} duplicada ignorada.`);
         return new NextResponse(null, { status: 200 });
       }
 
-      // 🟢 Acesso seguro ao contact name
-      const contactProfile = contacts?.[0];
-      const customerName = contactProfile?.profile.name || "Cliente";
-
-      let content: string | undefined;
-      let interactionId: string | undefined;
-
-      // 1. EXTRAÇÃO E NORMALIZAÇÃO
-      if (msg.type === "text") {
-        content = msg.text.body;
-      } else if (msg.type === "interactive") {
-        const interactive = msg.interactive;
-        if (interactive.type === "button_reply") {
-          interactionId = interactive.button_reply.id;
-          content = interactive.button_reply.title;
-        } else if (interactive.type === "list_reply") {
-          interactionId = interactive.list_reply.id;
-          content = interactive.list_reply.title;
-        }
-      } else if (msg.type === "button") {
-        // Botão de Template (Quick Reply)
-        interactionId = msg.button.payload;
-        content = msg.button.text;
-      }
-
-      // Se não conseguimos extrair nada útil, ignoramos a lógica do bot
+      // 2. EXTRAÇÃO DOS DADOS DE ROTEAMENTO
+      const { content, interactionId } = extractRoutingData(msg);
+      // Se não conseguimos extrair nada útil (e.g., mensagem de mídia sem legenda), saímos.
       if (!content && !interactionId) {
+        // A mensagem será salva no DB por processInboundMessage, mas não aciona o bot.
         return new NextResponse(null, { status: 200 });
       }
 
-      // 2. BUSCA E HISTÓRICO
+      // 3. OBTENÇÃO DO CONTATO E CONVERSA
       const contact = await getOrCreateContact(from, customerName);
-      await saveMessage(from, content || "[Mídia/Outros]", "INBOUND");
+      const talkId = contact.activeTalkId;
 
-      // 3. ROTEADOR DE LÓGICA
+      // 4. PERSISTÊNCIA ATÔMICA DA MENSAGEM
+      // Salva no DB e atualiza lastInboundAt (e/ou status se for human_pending/closed, se quiser)
+      await processInboundMessage(msg, talkId ?? null); // ✅ Mantém a performance e atomicidade
 
-      // MODO AGENTE (Prioridade Máxima: Humano no comando)
-      if (contact.botStatus === "AGENT") {
+      // ROTEADOR DE LÓGICA
+
+      // 🟢 PRI 1: SILÊNCIO E AGENTE (HUMAN_PENDING / HUMAN_ACTIVE)
+      // Esta é a PRIORIDADE MÁXIMA. Se o humano está envolvido, o bot silencia.
+      if (contact.botStatus === "HUMAN_PENDING" || contact.botStatus === "HUMAN_ACTIVE") {
+        // A mensagem já foi salva no DB. Não faz mais nada.
         return new NextResponse(null, { status: 200 });
       }
 
-      // MODO WORKFLOW (Prioridade 1: Resposta de Texto Livre)
-      if (contact.botStatus === "WORKFLOW" && contact.currentStep && msg.type === "text") {
-        await botConfig.handleFreeTextAnswer(from, content!, msg);
+      // 🟢 PRI 2: RESET (CLOSED)
+      // Se a conversa foi fechada pelo agente, reinicia o status e continua para o fluxo IDLE.
+      if (contact.botStatus === "CLOSED") {
+        await updateBotStatus(from, "IDLE", null);
+        // Continua o processamento no próximo bloco (PRI 3)
+      }
+
+      // PRI 3: WORKFLOW (Esperando resposta de texto)
+      if (
+        contact.botStatus === "WORKFLOW" &&
+        contact.currentStep &&
+        msg.type === "text" &&
+        content
+      ) {
+        await botConfig.handleFreeTextAnswer(from, content, msg);
         return new NextResponse(null, { status: 200 });
       }
 
@@ -107,14 +105,17 @@ export async function POST(req: NextRequest) {
 
         // 🟢 2.2: INTERAÇÕES (Botões de Quiz ou Menu)
         if (interactionId) {
-          // Respostas do Quiz OU Botão de "Falar com consultor" (EXIT_TO_AGENT)
-          // Se for EXIT_TO_AGENT, o handleQuizAnswer vai tratar.
           if (interactionId.startsWith("q") || interactionId === "EXIT_TO_AGENT") {
-            await botConfig.handleQuizAnswer(from, interactionId);
-          }
-          if (interactionId.startsWith("q")) {
-            // Respostas do Quiz (q1_vendas, q2_sim...)
-            await botConfig.handleQuizAnswer(from, interactionId);
+            // Se contém "_" (qN_resposta) OU é o ID de Saída
+            if (interactionId.includes("_") || interactionId === "EXIT_TO_AGENT") {
+              // Ação: Resposta do Quiz ou Saída (Salva o estado e retorna ao menu)
+              await botConfig.handleQuizAnswer(from, interactionId);
+            } else {
+              // Se não contém "_" (qN) - É uma SELEÇÃO de etapa do menu principal
+              // Ação: Pergunta a questão (Inicia o workflow)
+              await updateBotStatus(from, "WORKFLOW", interactionId);
+              await botConfig.askQuizQuestion(from, interactionId);
+            }
           } else if (interactionId === "Começar agora") {
             await updateBotStatus(from, "WORKFLOW", "q1");
             await botConfig.askQuizQuestion(from, "q1");
