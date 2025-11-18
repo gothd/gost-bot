@@ -1,5 +1,5 @@
 import { firestore as db } from "@/lib/firestore";
-import { BotStatus, ContactData, MessageData, TalkData } from "@/types/bot";
+import { BotStatus, ContactData, MessageData, QuestData, TalkData } from "@/types/bot";
 import { WhatsAppMessage } from "@/types/whatsapp"; // ✅ Importação dos tipos do WhatsApp
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { WINDOW_HOURS_MS } from "./constants";
@@ -241,6 +241,53 @@ export async function closeCurrentTalk(from: string) {
     });
     await contactRef.update({ activeTalkId: null, botStatus: "IDLE", currentStep: null });
   }
+}
+
+/**
+ * 🏁 Finaliza o Quiz:
+ * 1. Copia as respostas para a subcoleção 'quests' (histórico permanente).
+ * 2. Muda o status para HUMAN_PENDING (Handoff).
+ */
+export async function submitQuizAndHandoff(
+  from: string,
+  talkId: string,
+  quizData: Record<string, string>
+) {
+  const batch = db.batch();
+  const contactRef = db.collection("contacts").doc(from);
+
+  // 1. Cria o documento na subcoleção 'quests'
+  const newQuestRef = contactRef.collection("quests").doc();
+
+  const questPayload: QuestData = {
+    talkId: talkId,
+    responses: quizData,
+    submittedAt: FieldValue.serverTimestamp(),
+    status: "COMPLETED",
+  };
+
+  batch.set(newQuestRef, questPayload);
+
+  // 2. Atualiza o Contato para HUMAN_PENDING
+  const contactUpdate: Partial<ContactData> = {
+    botStatus: "HUMAN_PENDING",
+    lastInboundAt: FieldValue.serverTimestamp() as any,
+    currentStep: null,
+  };
+
+  batch.update(contactRef, contactUpdate);
+
+  // 3. Atualiza a Talk para marcar que gerou uma Quest
+  const talkRef = contactRef.collection("talks").doc(talkId);
+  const talkUpdate: Partial<TalkData> = {
+    hasSubmittedQuest: true,
+    questId: newQuestRef.id,
+  };
+
+  batch.update(talkRef, talkUpdate);
+
+  await batch.commit();
+  console.log(`[QUIZ SUBMIT] Quest criada (${newQuestRef.id}) para ${from}. Status: HUMAN_PENDING`);
 }
 
 /**

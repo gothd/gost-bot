@@ -8,13 +8,19 @@ import {
 
 import { ButtonOption, ListRow } from "@/types/whatsapp";
 // 🚨 Importações corrigidas para o Firebase Service
-import { EXIT_TO_AGENT_ID } from "./constants";
+import {
+  DESCRIPTION_MAX_LENGTH,
+  EXIT_TO_AGENT_ID,
+  PROGRESS_PREFIX,
+  TITLE_MAX_LENGTH,
+} from "./constants";
 import {
   canBotReply,
   closeCurrentTalk,
   getActiveQuizData,
   getOrCreateContact,
   saveQuizResponse,
+  submitQuizAndHandoff,
   updateBotStatus,
 } from "./firebaseService";
 import { getMainMenuRows, quizDictionary } from "./quizFlow";
@@ -71,46 +77,79 @@ export const botConfig = {
     // 1. Busca o contato principal para obter o ID da conversa ativa
     const contact = await getOrCreateContact(to, "");
 
-    // 2. Busca os dados do quiz da conversa ativa (USANDO A NOVA FUNÇÃO)
+    // Garante talkId (fallback para string vazia se der erro, mas getOrCreate deve garantir)
     const talkId = contact.activeTalkId;
-    const currentResponses = await getActiveQuizData(to, talkId ?? null);
+    if (!talkId) {
+      await botConfig.fallback(to, "Erro de sessão. Digite 'oi' para reiniciar.");
+      return;
+    }
 
-    await updateBotStatus(to, "IDLE", null); // Limpa o passo e o status WORKFLOW
+    // Busca respostas atuais
+    const currentResponses = await getActiveQuizData(to, talkId);
 
-    // 3. Obtém as linhas do menu base
-    const baseRows = getMainMenuRows();
+    // Obtém todas as perguntas possíveis
+    const allQuestions = getMainMenuRows(); // Array de { id, title... }
 
-    // 4. Mapeia as linhas para adicionar a marca de progresso
-    const rows: ListRow[] = baseRows.map((row) => {
+    // 🔎 FILTRA PERGUNTAS NÃO RESPONDIDAS
+    const remainingQuestions = allQuestions.filter((q) => !currentResponses[q.id]);
+
+    // --- CENÁRIO A: QUIZ CONCLUÍDO (0 Restantes) ---
+    if (remainingQuestions.length === 0) {
+      // 1. Salva/Extrai dados e muda status para HUMAN_PENDING
+      await submitQuizAndHandoff(to, talkId, currentResponses);
+
+      // 2. Envia Feedback e Handoff
+      await botConfig.safeSendMessage(to, {
+        type: "text",
+        text: {
+          body: "🎉 Perfeito! Recebemos todas as informações do seu projeto.\n\nEstou transferindo você para a fila de atendimento prioritária. Um de nossos consultores analisará suas respostas e falará com você em instantes! 👨‍💻",
+        },
+      });
+      return;
+    }
+
+    // --- CENÁRIO B: APENAS 1 PERGUNTA RESTANTE (Auto-Disparo) ---
+    if (remainingQuestions.length === 1) {
+      const lastQuestionId = remainingQuestions[0].id;
+
+      // Muda status para WORKFLOW para esperar a resposta desta pergunta
+      await updateBotStatus(to, "WORKFLOW", lastQuestionId);
+
+      // Envia feedback visual rápido (opcional, mas bom para UX)
+      await botConfig.safeSendMessage(to, {
+        type: "text",
+        text: { body: "💡 Falta apenas mais uma..." },
+      });
+
+      // Dispara a pergunta diretamente
+      await botConfig.askQuizQuestion(to, lastQuestionId);
+      return;
+    }
+
+    // --- CENÁRIO C: VÁRIAS PERGUNTAS (>1) - MOSTRA O MENU ---
+    // (Lógica original mantida, mas atualizada para o fluxo normal)
+
+    await updateBotStatus(to, "IDLE", null);
+
+    const rows = allQuestions.map((row) => {
       const readableAnswer = currentResponses[row.id];
-
-      const PROGRESS_PREFIX = "✅ ";
-      const TITLE_MAX_LENGTH = 20;
-      const DESCRIPTION_MAX_LENGTH = 72; // Limite de caracteres para a descrição
 
       let newTitle: string;
 
-      // 1. TRUNCAGEM DO TITLE (Limite: 20)
       if (readableAnswer) {
-        // Se respondido: usa prefixo
         newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, PROGRESS_PREFIX);
       } else {
-        // Se não respondido: sem prefixo
         newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, "");
       }
 
-      // 2. TRUNCAGEM DA DESCRIPTION (Limite: 72)
       let newDescription: string;
-
       if (readableAnswer) {
-        // Se respondido, a descrição mostra a resposta do usuário
         const answerText = `Sua resposta: ${readableAnswer}`;
         newDescription = truncateWhatsAppText(answerText, DESCRIPTION_MAX_LENGTH, "");
       } else {
-        // Se não respondido, usa a descrição padrão da linha (se existir)
         newDescription = row.description
           ? truncateWhatsAppText(row.description, DESCRIPTION_MAX_LENGTH, "")
-          : ""; // Garante string vazia se row.description for undefined
+          : "";
       }
 
       return {
@@ -122,7 +161,7 @@ export const botConfig = {
 
     await sendWhatsAppList(
       to,
-      "Selecione uma etapa para responder ou editar. As etapas respondidas são marcadas com ✅.",
+      `Faltam ${remainingQuestions.length} etapas. Selecione qual deseja responder:`,
       "Ver etapas",
       "Progresso do Orçamento",
       rows

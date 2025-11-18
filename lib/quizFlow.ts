@@ -112,8 +112,6 @@ export function getMainMenuRows(): ListRow[] {
   return Object.values(quizDictionary).map((step) => ({
     id: step.id, // "q1", "q2", etc.
     title: step.title,
-    // Deixamos a descrição do menu principal curta e genérica,
-    // mas você pode usar 'step.question' (ou uma versão truncada) se preferir.
-    description: `Pergunta: ${step.question.substring(0, 50)}...`, // Max 72 chars
+    description: `Pergunta: ${step.question}`, // Max 72 chars
   }));
 }

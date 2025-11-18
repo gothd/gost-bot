@@ -13,3 +13,7 @@ export const PRIVACY_URL = "/privacidade";
 
 export const WINDOW_HOURS_MS = 24 * 60 * 60 * 1000; // 24 horas em milissegundos
 export const EXIT_TO_AGENT_ID = "EXIT_TO_AGENT"; // ID constante para a ação de sair
+
+export const PROGRESS_PREFIX = "✅ ";
+export const TITLE_MAX_LENGTH = 20;
+export const DESCRIPTION_MAX_LENGTH = 72;
