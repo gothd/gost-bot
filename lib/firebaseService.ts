@@ -94,18 +94,51 @@ export async function getOrCreateContact(from: string, name: string): Promise<Co
   const doc = await ref.get();
 
   if (doc.exists) {
-    return doc.data() as ContactData;
+    const contactData = doc.data() as ContactData;
+
+    // Se existe, mas por algum motivo a talk ativa sumiu, criamos uma nova talk
+    if (!contactData.activeTalkId) {
+      const newTalkRef = ref.collection("talks").doc();
+      // Atualiza o documento Contact
+      await ref.update({
+        activeTalkId: newTalkRef.id,
+        lastInboundAt: FieldValue.serverTimestamp() as unknown as Timestamp,
+      });
+      // Cria um documento vazio da Talk para garantir a subcoleção exista
+      await ref.collection("talks").doc(newTalkRef.id).set({
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      contactData.activeTalkId = newTalkRef.id;
+    }
+
+    return contactData;
   }
+
+  // Se o contato NÃO EXISTE, cria o documento e a primeira Talk
+  const newTalkId = ref.collection("talks").doc().id; // Cria ID da primeira Talk
 
   const newContact: ContactData = {
     phoneNumber: from,
     name: name,
     botStatus: "IDLE",
-    lastInboundAt: Timestamp.now(), // Assume agora como início se for novo
+    activeTalkId: newTalkId, // ✅ Atribui o novo ID
+    lastInboundAt: Timestamp.now(),
     createdAt: Timestamp.now(),
   };
 
-  await ref.set(newContact);
+  const batch = db.batch();
+
+  // 1. Cria o documento do Contato
+  batch.set(ref, newContact);
+
+  // 2. Cria o documento da primeira Talk
+  batch.set(ref.collection("talks").doc(newTalkId), {
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  await batch.commit(); // ✅ Cria os dois atomicamente
+
   return newContact;
 }
 

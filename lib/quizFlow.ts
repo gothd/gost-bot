@@ -46,8 +46,6 @@ export const quizDictionary: Record<string, QuizStep> = {
     options: [
       { id: "q2_sim", title: "Sim, tudo pronto" }, // OK (16)
       { id: "q2_parcial", title: "Tenho alguma coisa" }, // OK (19)
-      { id: "q2_nao", title: "Não, preciso de ajuda" }, // 🚨 Original: 21.
-      // Otimizado para 20 ou menos
       { id: "q2_nao", title: "Não, preciso de ajuda" }, // OK (20)
     ],
   },
