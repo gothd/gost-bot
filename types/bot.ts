@@ -29,14 +29,33 @@ export interface TalkData {
 }
 
 /**
- * 📋 Interface para o documento 'quests/{questId}' (subcoleção de contacts).
- * Representa o formulário/lead finalizado ("snapshot" dos dados).
+ * 📝 Representa uma linha do relatório final
+ */
+export interface QuestSummaryItem {
+  stepId: string; // "q1"
+  question: string; // "Qual é o principal objetivo do seu site?" (Contexto preservado)
+  answer: string; // "Vender produtos" (Legível)
+}
+
+/**
+ * 📋 Interface para o documento 'quests/{questId}'
  */
 export interface QuestData {
-  talkId: string; // Rastreabilidade da conversa de origem
-  responses: Record<string, string>; // As respostas consolidadas
-  submittedAt: FieldValue | Timestamp; // Data do envio
-  status: "COMPLETED" | "REVIEWED" | "ARCHIVED"; // Status do processamento do lead
+  talkId: string;
+  responses: Record<string, string>; // IDs (para lógica/score)
+
+  // O relatório completo e imutável para o consultor
+  summary: QuestSummaryItem[];
+
+  // Analytics
+  progress: string;
+  totalSteps: number;
+  score: number;
+  category: "ECOMMERCE" | "INSTITUCIONAL" | "LANDING_PAGE" | "OUTROS";
+  priority: "HIGH" | "MEDIUM" | "LOW";
+
+  submittedAt: FieldValue | Timestamp;
+  status: "COMPLETED" | "REVIEWED" | "ARCHIVED";
 }
 
 /**

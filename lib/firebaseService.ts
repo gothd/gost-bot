@@ -3,6 +3,8 @@ import { BotStatus, ContactData, MessageData, QuestData, TalkData } from "@/type
 import { WhatsAppMessage } from "@/types/whatsapp"; // ✅ Importação dos tipos do WhatsApp
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { WINDOW_HOURS_MS } from "./constants";
+import { calculateLeadScore, categorizeProject, generateQuestSummary } from "./logicUtils";
+import { getMainMenuRows } from "./quizFlow";
 
 // --- Tipos de Retorno para o Roteador ---
 
@@ -244,31 +246,53 @@ export async function closeCurrentTalk(from: string) {
 }
 
 /**
- * 🏁 Finaliza o Quiz:
- * 1. Copia as respostas para a subcoleção 'quests' (histórico permanente).
- * 2. Muda o status para HUMAN_PENDING (Handoff).
+ * 🏁 Finaliza o Quiz e realiza o Handoff.
+ * Aceita dados brutos (IDs) para cálculo de score e dados legíveis para o humano.
  */
 export async function submitQuizAndHandoff(
   from: string,
   talkId: string,
-  quizData: Record<string, string>
+  quizDataIds: Record<string, string> // Apenas IDs são necessários agora!
 ) {
   const batch = db.batch();
   const contactRef = db.collection("contacts").doc(from);
 
-  // 1. Cria o documento na subcoleção 'quests'
+  // 1. Cálculos e Snapshot
+  const score = calculateLeadScore(quizDataIds);
+  const category = categorizeProject(quizDataIds);
+  // 📸 Gera o relatório imutável aqui
+  const summary = generateQuestSummary(quizDataIds);
+
+  // ... (Lógica de prioridade e progresso mantida) ...
+  let priority: "HIGH" | "MEDIUM" | "LOW" = "LOW";
+  if (score >= 60) priority = "HIGH";
+  else if (score >= 30) priority = "MEDIUM";
+
+  const totalSteps = getMainMenuRows().length;
+  const answeredSteps = Object.keys(quizDataIds).length;
+  const progressString = `${answeredSteps}/${totalSteps}`;
+
+  // 2. Cria QuestData
   const newQuestRef = contactRef.collection("quests").doc();
 
   const questPayload: QuestData = {
-    talkId: talkId,
-    responses: quizData,
+    talkId,
+    responses: quizDataIds, // Mantém os IDs para scripts futuros
+    summary: summary, // ✅ O Relatório Humano
+
+    progress: progressString,
+    totalSteps,
+    score,
+    category: category as any,
+    priority,
+
     submittedAt: FieldValue.serverTimestamp(),
     status: "COMPLETED",
   };
 
   batch.set(newQuestRef, questPayload);
 
-  // 2. Atualiza o Contato para HUMAN_PENDING
+  // 3. Atualiza o Contato para HUMAN_PENDING
   const contactUpdate: Partial<ContactData> = {
     botStatus: "HUMAN_PENDING",
     lastInboundAt: FieldValue.serverTimestamp() as any,
@@ -277,7 +301,7 @@ export async function submitQuizAndHandoff(
 
   batch.update(contactRef, contactUpdate);
 
-  // 3. Atualiza a Talk para marcar que gerou uma Quest
+  // 4. Atualiza a Talk
   const talkRef = contactRef.collection("talks").doc(talkId);
   const talkUpdate: Partial<TalkData> = {
     hasSubmittedQuest: true,
@@ -287,7 +311,7 @@ export async function submitQuizAndHandoff(
   batch.update(talkRef, talkUpdate);
 
   await batch.commit();
-  console.log(`[QUIZ SUBMIT] Quest criada (${newQuestRef.id}) para ${from}. Status: HUMAN_PENDING`);
+  console.log(`[QUIZ SUBMIT] Quest finalizada com Summary.`);
 }
 
 /**

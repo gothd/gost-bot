@@ -8,12 +8,7 @@ import {
 
 import { ButtonOption, ListRow } from "@/types/whatsapp";
 // 🚨 Importações corrigidas para o Firebase Service
-import {
-  DESCRIPTION_MAX_LENGTH,
-  EXIT_TO_AGENT_ID,
-  PROGRESS_PREFIX,
-  TITLE_MAX_LENGTH,
-} from "./constants";
+import { EXIT_TO_AGENT_ID } from "./constants";
 import {
   canBotReply,
   closeCurrentTalk,
@@ -23,8 +18,8 @@ import {
   submitQuizAndHandoff,
   updateBotStatus,
 } from "./firebaseService";
+import { getReadableResponse, normalizeText, truncateWhatsAppText } from "./logicUtils";
 import { getMainMenuRows, quizDictionary } from "./quizFlow";
-import { normalizeText, truncateWhatsAppText } from "./textUtils";
 
 export const botConfig = {
   // Função utilitária segura de envio
@@ -74,96 +69,77 @@ export const botConfig = {
    * 1. Inicia o questionário (chamado quando o usuário clica em "Começar agora")
    */
   startQuiz: async (to: string) => {
-    // 1. Busca o contato principal para obter o ID da conversa ativa
     const contact = await getOrCreateContact(to, "");
-
-    // Garante talkId (fallback para string vazia se der erro, mas getOrCreate deve garantir)
     const talkId = contact.activeTalkId;
     if (!talkId) {
-      await botConfig.fallback(to, "Erro de sessão. Digite 'oi' para reiniciar.");
+      await botConfig.fallback(to, "Erro sessão.");
       return;
     }
 
-    // Busca respostas atuais
+    // 📦 currentResponses agora contém IDs (ex: { q1: "q1_vendas", q4: "Urgente" })
     const currentResponses = await getActiveQuizData(to, talkId);
+    const allQuestions = getMainMenuRows();
 
-    // Obtém todas as perguntas possíveis
-    const allQuestions = getMainMenuRows(); // Array de { id, title... }
+    // Filtro de perguntas restantes (Lógica mantida)
+    const remainingQuestions = allQuestions.filter((q) => {
+      const answer = currentResponses[q.id];
+      return !answer || answer === q.id;
+    });
 
-    // 🔎 FILTRA PERGUNTAS NÃO RESPONDIDAS
-    const remainingQuestions = allQuestions.filter((q) => !currentResponses[q.id]);
-
-    // --- CENÁRIO A: QUIZ CONCLUÍDO (0 Restantes) ---
+    // --- CENÁRIO A: QUIZ CONCLUÍDO (Handoff) ---
     if (remainingQuestions.length === 0) {
-      // 1. Salva/Extrai dados e muda status para HUMAN_PENDING
+      // Chamada Simplificada: Passa apenas os IDs (currentResponses)
+      // O service vai gerar o Summary (Pergunta + Resposta Legível) automaticamente.
       await submitQuizAndHandoff(to, talkId, currentResponses);
 
-      // 2. Envia Feedback e Handoff
       await botConfig.safeSendMessage(to, {
         type: "text",
-        text: {
-          body: "🎉 Perfeito! Recebemos todas as informações do seu projeto.\n\nEstou transferindo você para a fila de atendimento prioritária. Um de nossos consultores analisará suas respostas e falará com você em instantes! 👨‍💻",
-        },
+        text: { body: "🎉 Perfeito! Recebemos suas informações...\n(Transferindo...)" },
       });
       return;
     }
 
-    // --- CENÁRIO B: APENAS 1 PERGUNTA RESTANTE (Auto-Disparo) ---
+    // --- CENÁRIO B: 1 PERGUNTA ---
     if (remainingQuestions.length === 1) {
-      const lastQuestionId = remainingQuestions[0].id;
-
-      // Muda status para WORKFLOW para esperar a resposta desta pergunta
-      await updateBotStatus(to, "WORKFLOW", lastQuestionId);
-
-      // Envia feedback visual rápido (opcional, mas bom para UX)
-      await botConfig.safeSendMessage(to, {
-        type: "text",
-        text: { body: "💡 Falta apenas mais uma..." },
-      });
-
-      // Dispara a pergunta diretamente
-      await botConfig.askQuizQuestion(to, lastQuestionId);
+      const lastId = remainingQuestions[0].id;
+      await updateBotStatus(to, "WORKFLOW", lastId);
+      await botConfig.askQuizQuestion(to, lastId);
       return;
     }
 
-    // --- CENÁRIO C: VÁRIAS PERGUNTAS (>1) - MOSTRA O MENU ---
-    // (Lógica original mantida, mas atualizada para o fluxo normal)
-
+    // --- CENÁRIO C: MENU (Display) ---
     await updateBotStatus(to, "IDLE", null);
 
     const rows = allQuestions.map((row) => {
-      const readableAnswer = currentResponses[row.id];
+      const rawAnswerId = currentResponses[row.id]; // Pega o ID (q1_vendas)
+      const isValid = rawAnswerId && rawAnswerId !== row.id;
 
-      let newTitle: string;
+      // 🔄 CONVERSÃO PARA DISPLAY: Transforma ID em Texto apenas para mostrar na lista
+      const displayAnswer = isValid ? getReadableResponse(row.id, rawAnswerId) : null;
 
-      if (readableAnswer) {
-        newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, PROGRESS_PREFIX);
+      const PROGRESS_PREFIX = "✅ ";
+      // ... constantes de limite ...
+
+      // Title logic
+      let newTitle = truncateWhatsAppText(row.title, 20, isValid ? PROGRESS_PREFIX : "");
+
+      // Description logic
+      let newDescription = "";
+      if (isValid && displayAnswer) {
+        // Mostra o texto bonitinho ("Vender produtos") na descrição
+        newDescription = truncateWhatsAppText(`Sua resposta: ${displayAnswer}`, 72, "");
       } else {
-        newTitle = truncateWhatsAppText(row.title, TITLE_MAX_LENGTH, "");
+        newDescription = row.description ? truncateWhatsAppText(row.description, 72, "") : "";
       }
 
-      let newDescription: string;
-      if (readableAnswer) {
-        const answerText = `Sua resposta: ${readableAnswer}`;
-        newDescription = truncateWhatsAppText(answerText, DESCRIPTION_MAX_LENGTH, "");
-      } else {
-        newDescription = row.description
-          ? truncateWhatsAppText(row.description, DESCRIPTION_MAX_LENGTH, "")
-          : "";
-      }
-
-      return {
-        id: row.id,
-        title: newTitle,
-        description: newDescription,
-      };
+      return { id: row.id, title: newTitle, description: newDescription };
     });
 
     await sendWhatsAppList(
       to,
-      `Faltam ${remainingQuestions.length} etapas. Selecione qual deseja responder:`,
+      `Faltam ${remainingQuestions.length} etapas...`,
       "Ver etapas",
-      "Progresso do Orçamento",
+      "Progresso",
       rows
     );
   },
@@ -212,19 +188,19 @@ export const botConfig = {
   },
 
   /**
-   * 3. Recebe a resposta de uma pergunta de OPÇÕES (ex: "q1_vendas")
+   * 3. Handle Quiz Answer (SALVA ID)
    */
   handleQuizAnswer: async (to: string, answerId: string) => {
-    // 🚨 INTERCEPTAÇÃO DE SAÍDA
     if (answerId === EXIT_TO_AGENT_ID) {
       await botConfig.transferToAgent(to);
       return;
     }
 
-    const questionId = answerId.split("_")[0]; // "q1"
+    const questionId = answerId.split("_")[0];
+
+    // Validação básica
     const step = quizDictionary[questionId];
-    // ⚠️ Tratamento de erro: Se o step não é válido, voltamos ao menu principal (caminho seguro)
-    if (!step || step.type !== "options" || !step.options) {
+    if (!step) {
       console.error(`[QUIZ] Etapa ${questionId} inválida. Retornando ao menu principal.`);
       await botConfig.safeSendMessage(to, {
         type: "text",
@@ -236,34 +212,16 @@ export const botConfig = {
       return;
     }
 
-    // 🔍 BUSCA DO TEXTO LEGÍVEL
-    const selectedOption = step.options.find((option) => option.id === answerId);
-    const readableAnswer = selectedOption?.title || answerId; // Usa o título ou o ID como fallback
+    // 🔍 LOG: Apenas para debug, pegamos o legível
+    const readableForLog = getReadableResponse(questionId, answerId);
+    console.log(`[QUIZ] ID Salvo: ${answerId} ("${readableForLog}")`);
 
-    // ⚠️ Tratamento de erro: Se o ID da resposta não for encontrado na lista de opções
-    if (!readableAnswer) {
-      console.warn(
-        `[QUIZ] Opção ${answerId} não encontrada para ${questionId}. Repetindo pergunta.`
-      );
-      await botConfig.safeSendMessage(to, {
-        type: "text",
-        text: { body: "❌ Opção inválida. Por favor, selecione uma das opções abaixo:" },
-      });
-      // Repete a pergunta atual, dando ao usuário uma nova chance
-      await botConfig.askQuizQuestion(to, questionId);
-      return;
-    }
+    // 💾 MUDANÇA PRINCIPAL: Salva o ID bruto no Firestore
+    await saveQuizResponse(to, questionId, answerId);
 
-    console.log(`[QUIZ] Resposta de ${to} para ${questionId}: ${readableAnswer} (${answerId})`);
-
-    // 💾 Salva o TEXTO LEGÍVEL como a resposta no Firestore
-    await saveQuizResponse(to, questionId, readableAnswer);
-
-    // Após salvar, envia o menu principal de volta
     await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Resposta salva!" } });
     await botConfig.startQuiz(to);
   },
-
   /**
    * 4. Recebe a resposta de uma pergunta de TEXTO
    */
@@ -279,17 +237,13 @@ export const botConfig = {
     const currentQuestionId = contact.currentStep;
 
     if (currentQuestionId) {
-      console.log(`[QUIZ] Resposta (texto) de ${to} para ${currentQuestionId}: ${text}`);
-
+      // Para texto livre, o ID e o Texto são a mesma coisa
       await saveQuizResponse(to, currentQuestionId, text);
 
-      // Limpa o estado no FIRESTORE e volta ao menu
       await updateBotStatus(to, "IDLE", null);
-
-      await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Resposta anotada!" } });
+      await botConfig.safeSendMessage(to, { type: "text", text: { body: "✅ Anotado!" } });
       await botConfig.startQuiz(to);
     } else {
-      // Se não há currentStep, o bot não estava esperando texto do quiz.
       await botConfig.fallback(to, "Texto não reconhecido", rawMessage);
     }
   },
